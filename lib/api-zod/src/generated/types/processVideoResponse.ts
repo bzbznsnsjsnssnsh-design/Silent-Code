@@ -6,6 +6,8 @@
  * OpenAPI spec version: 0.1.0
  */
 
-export interface HealthStatus {
+export interface ProcessVideoResponse {
+  jobId: string;
   status: string;
+  message: string;
 }
