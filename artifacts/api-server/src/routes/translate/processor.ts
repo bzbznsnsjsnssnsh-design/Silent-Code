@@ -2,13 +2,13 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import { mkdtemp, unlink, copyFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { join, dirname } from "path";
 import { existsSync } from "fs";
 import { logger } from "../../lib/logger.js";
 import { updateJob } from "./jobs.js";
 import { synthesizeEdgeTTS, EDGE_TTS_VOICES } from "./edge-tts.js";
 import { hasCookies, getCookiesPath, hasYtCookies, getYtCookiesPath } from "./cookies.js";
-import { translateWithGemini, getTranscriptWithGemini } from "./gemini.js";
+import { translateWithGemini } from "./gemini.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,7 +16,9 @@ const workspaceRoot = "/home/runner/workspace";
 const venvBinPath = join(workspaceRoot, ".venv", "bin");
 const pythonLibsPath = join(workspaceRoot, ".pythonlibs", "bin");
 const pythonBin = join(pythonLibsPath, "python3");
-for (const p of [venvBinPath, pythonLibsPath]) {
+// Node.js binary path for yt-dlp's --js-runtimes (n-challenge solver)
+export const nodeBinPath = process.execPath;
+for (const p of [venvBinPath, pythonLibsPath, dirname(process.execPath)]) {
   if (!process.env.PATH?.includes(p)) {
     process.env.PATH = `${p}:${process.env.PATH || ""}`;
   }
@@ -120,48 +122,64 @@ async function downloadAudioSegment(
   cookiesArgs: string[]
 ): Promise<void> {
   const safeUrl = cleanYouTubeUrl(videoUrl);
+  const endTime = startTime + SEGMENT_DURATION;
 
-  async function tryClient(client: string): Promise<string> {
-    const { stdout } = await execFileAsync("yt-dlp", [
+  // Format time as HH:MM:SS for --download-sections
+  const fmtTime = (s: number) => {
+    const h = Math.floor(s / 3600).toString().padStart(2, "0");
+    const m = Math.floor((s % 3600) / 60).toString().padStart(2, "0");
+    const sec = Math.floor(s % 60).toString().padStart(2, "0");
+    return `${h}:${m}:${sec}`;
+  };
+
+  // Use Node.js for n-challenge solving (required by yt-dlp 2026+)
+  const jsRuntimesArgs = ["--js-runtimes", `node:${nodeBinPath}`];
+
+  // Direct download: yt-dlp handles everything including n-challenge
+  async function tryDownload(client: string, withCookies: boolean): Promise<void> {
+    await execFileAsync("yt-dlp", [
       "-f", "bestaudio/best",
-      "--get-url",
+      "-x",
+      "--audio-format", "mp3",
+      "--audio-quality", "5",
+      "--download-sections", `*${fmtTime(startTime)}-${fmtTime(endTime)}`,
+      "--force-keyframes-at-cuts",
       "--no-playlist",
       "--extractor-args", `youtube:player_client=${client}`,
       "--no-check-certificates",
-      ...cookiesArgs,
+      "--no-warnings",
+      ...jsRuntimesArgs,
+      ...(withCookies ? cookiesArgs : []),
+      "-o", outputPath,
       safeUrl,
-    ], { timeout: 60_000 });
-    const line = stdout.split("\n").find(l => l.trim().startsWith("http"));
-    return line?.trim() ?? "";
+    ], { timeout: 120_000 });
   }
 
-  let audioUrl = "";
   let lastErr: Error | null = null;
-  for (const client of ["mweb", "android", "ios", "web"]) {
+  // web with cookies: primary (n-challenge solved via Node.js)
+  // ios without cookies: fallback (no n-challenge needed, no cookie support)
+  // mweb/web without cookies: last resort
+  const attempts: Array<{ client: string; withCookies: boolean }> = [
+    { client: "web", withCookies: cookiesArgs.length > 0 },
+    { client: "ios", withCookies: false },
+    { client: "mweb", withCookies: cookiesArgs.length > 0 },
+    { client: "web", withCookies: false },
+  ];
+  for (const { client, withCookies } of attempts) {
     try {
-      audioUrl = await tryClient(client);
-      if (audioUrl.startsWith("http")) break;
+      await tryDownload(client, withCookies);
+      if (existsSync(outputPath)) return;
     } catch (e: any) {
       lastErr = e;
+      logger.warn({ client, withCookies, err: String(e?.message || e).slice(0, 200) }, "yt-dlp client failed, trying next");
     }
   }
 
-  if (!audioUrl) {
-    const msg = lastErr?.message || "خطأ غير معروف";
-    if (msg.includes("Sign in") || msg.includes("bot")) {
-      throw new Error("يوتيوب يطلب تسجيل الدخول. يرجى إضافة الكوكيز.");
-    }
-    throw new Error(`فشل الحصول على رابط الصوت: ${msg}`);
+  const msg = lastErr?.message || "خطأ غير معروف";
+  if (msg.includes("Sign in") || msg.includes("bot") || msg.includes("confirm your age")) {
+    throw new Error("يوتيوب يطلب تسجيل الدخول. يرجى إضافة كوكيز يوتيوب.");
   }
-
-  await execFileAsync("ffmpeg", [
-    "-ss", String(startTime),
-    "-t", String(SEGMENT_DURATION),
-    "-i", audioUrl,
-    "-vn", "-ar", "16000", "-ac", "1",
-    "-f", "mp3", "-y",
-    outputPath,
-  ], { timeout: 120_000 });
+  throw new Error(`فشل تنزيل الصوت: ${msg.slice(0, 300)}`);
 }
 
 // ── Step 2: Transcribe audio with Whisper (base model) ────────────────────
@@ -222,20 +240,12 @@ export async function processVideoSegment(options: ProcessOptions): Promise<void
       logger.info({ jobId, chars: transcript.length, method: "whisper" }, "Transcript ready");
     }
 
-    // ── Step 2b: Gemini transcript fallback if yt-dlp failed ──────────────
-    if (!transcript || transcript.trim().length < 3) {
-      updateJob(jobId, { progress: "🤖 استخراج النص عبر Gemini AI..." });
-      logger.info({ jobId }, "Falling back to Gemini transcript");
-      try {
-        transcript = await getTranscriptWithGemini(safeUrl, startTime, SEGMENT_DURATION);
-        logger.info({ jobId, chars: transcript.length, method: "gemini" }, "Transcript ready via Gemini");
-      } catch (e: any) {
-        logger.warn({ jobId, err: e?.message }, "Gemini transcript also failed");
-      }
+    if (!audioDownloaded) {
+      throw new Error("فشل تنزيل الصوت من يوتيوب. تأكد من الرابط وصلاحية كوكيز يوتيوب.");
     }
 
     if (!transcript || transcript.trim().length < 3) {
-      throw new Error("لم يتم اكتشاف كلام في هذا المقطع");
+      throw new Error("لم يتم اكتشاف كلام في هذا المقطع (Whisper)");
     }
 
     // ── Step 3: Translate to Arabic via Gemini ─────────────────────────────

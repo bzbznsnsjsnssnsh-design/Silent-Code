@@ -5,7 +5,7 @@ import { createJob, getJob } from "./jobs.js";
 import { processVideoSegment, getAudioPath, TTS_VOICES } from "./processor.js";
 import {
   saveCookies, deleteCookies, hasCookies, getDetailedCookiesStatus, validateGeminiCookies,
-  saveYtCookies, deleteYtCookies, getYtCookiesStatus,
+  saveYtCookies, deleteYtCookies, getYtCookiesStatus, validateYtCookies,
 } from "./cookies.js";
 
 const router: IRouter = Router();
@@ -66,6 +66,21 @@ router.post("/translate/yt-cookies", async (req, res) => {
 router.delete("/translate/yt-cookies", async (_req, res) => {
   await deleteYtCookies();
   res.json({ success: true, message: "تم حذف كوكيز يوتيوب" });
+});
+
+router.post("/translate/yt-cookies/validate", async (_req, res) => {
+  const hasYt = await (async () => {
+    try {
+      const s = await getYtCookiesStatus();
+      return s.hasYtCookies;
+    } catch { return false; }
+  })();
+  if (!hasYt) {
+    res.json({ valid: false, message: "لا توجد كوكيز يوتيوب محفوظة" });
+    return;
+  }
+  const result = await validateYtCookies();
+  res.json(result);
 });
 
 router.post("/translate/cookies/validate", async (_req, res) => {

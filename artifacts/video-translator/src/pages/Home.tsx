@@ -111,6 +111,32 @@ async function deleteYtCookiesReq() {
   await fetch('/api/translate/yt-cookies', { method: 'DELETE' });
 }
 
+async function validateYtCookiesApi(): Promise<{valid: boolean; message: string}> {
+  try {
+    const r = await fetch('/api/translate/yt-cookies/validate', { method: 'POST' });
+    return await r.json();
+  } catch {
+    return { valid: false, message: 'فشل الاتصال بالخادم' };
+  }
+}
+
+/** Parse "[HH:MM:SS] text" format into sortable segments */
+function parseTranslationSegments(translation: string): {ts: number; text: string}[] {
+  const segs: {ts: number; text: string}[] = [];
+  const regex = /\[(\d{2}):(\d{2}):(\d{2})\]\s*([\s\S]*?)(?=\n\[|\s*$)/g;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(translation)) !== null) {
+    const ts = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseInt(m[3]);
+    const text = m[4].trim();
+    if (text) segs.push({ ts, text });
+  }
+  // If no timestamp format, treat whole text as one segment starting at t=0
+  if (segs.length === 0 && translation.trim()) {
+    segs.push({ ts: 0, text: translation.trim() });
+  }
+  return segs;
+}
+
 async function fetchCookieStatus(): Promise<CookieStatus> {
   try {
     const r = await fetch('/api/translate/cookies/status');
@@ -179,6 +205,10 @@ export default function Home() {
   const syncOffsetRef = useRef<number>(0);
   const [syncOffset, setSyncOffset] = useState<number>(0);
 
+  // ── Progressive text display ──────────────────────────────────────────────
+  const currentTranslationSegsRef = useRef<{ts: number; text: string}[]>([]);
+  const lastShownSentenceRef = useRef<string>('');
+
   const [jobs, setJobs] = useState<Map<number, SegJob>>(new Map());
   const [activeSeg, setActiveSeg] = useState<number>(-1);
   const [processingProgress, setProcessingProgress] = useState('');
@@ -203,6 +233,8 @@ export default function Home() {
   const [ytCookieStatus, setYtCookieStatus] = useState<YtCookieStatus | null>(null);
   const [ytCookieSaving, setYtCookieSaving] = useState(false);
   const ytSaveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [ytValidation, setYtValidation] = useState<{valid: boolean; message: string} | null>(null);
+  const [ytChecking, setYtChecking] = useState(false);
 
   const { data: modelsData } = useGetTtsModels();
 
@@ -418,12 +450,17 @@ export default function Home() {
 
     playingSegRef.current = seg;
     segPlayStartMsRef.current = Date.now();
-    setCurrentSentence(job.translation || '');
+    // Load segments for progressive display (don't show all text at once)
+    currentTranslationSegsRef.current = parseTranslationSegments(job.translation || '');
+    lastShownSentenceRef.current = '';
+    setCurrentSentence('');
 
     audioEl.onloadedmetadata = () => applySyncRates(audioEl);
 
     audioEl.onended = () => {
       finishedSegRef.current = seg;
+      currentTranslationSegsRef.current = [];
+      lastShownSentenceRef.current = '';
       setCurrentSentence('');
       if (ytRef.current) ytRef.current.setPlaybackRate(1.0);
       standbyReadyRef.current = false;
@@ -448,7 +485,9 @@ export default function Home() {
         standbyReadyRef.current = false;
         playingSegRef.current = -1;
 
-        setCurrentSentence(nextJob.translation || '');
+        currentTranslationSegsRef.current = parseTranslationSegments(nextJob.translation || '');
+        lastShownSentenceRef.current = '';
+        setCurrentSentence('');
         playingSegRef.current = nextSeg;
         segPlayStartMsRef.current = Date.now();
 
@@ -456,6 +495,8 @@ export default function Home() {
         nowActive.onloadedmetadata = () => applySyncRates(nowActive);
         nowActive.onended = () => {
           finishedSegRef.current = nextSeg;
+          currentTranslationSegsRef.current = [];
+          lastShownSentenceRef.current = '';
           setCurrentSentence('');
           if (ytRef.current) ytRef.current.setPlaybackRate(1.0);
           standbyReadyRef.current = false;
@@ -501,6 +542,21 @@ export default function Home() {
       let lastSyncCheckMs = 0;
       while (!stopRequestedRef.current) {
         const currentTime = ytRef.current?.getCurrentTime() ?? 0;
+
+        // ── Progressive text display: show segment matching current video time ─
+        const tranSegs = currentTranslationSegsRef.current;
+        if (tranSegs.length > 0) {
+          let matched: {ts: number; text: string} | null = null;
+          for (const s of tranSegs) {
+            if (s.ts <= currentTime) matched = s;
+            else break;
+          }
+          if (matched && matched.text !== lastShownSentenceRef.current) {
+            lastShownSentenceRef.current = matched.text;
+            setCurrentSentence(matched.text);
+          }
+        }
+
         const rawSeg = Math.floor(currentTime / SEGMENT_STRIDE) * SEGMENT_STRIDE;
         const audioStillPlaying = playingSegRef.current === activeSegRef.current &&
           (() => { const a = getActiveAudio(); return a && !a.paused && !a.ended && a.currentTime < (a.duration - 0.3); })();
@@ -620,8 +676,17 @@ export default function Home() {
   const handleDeleteYtCookies = async () => {
     await deleteYtCookiesReq();
     setYtCookieStatus(null);
+    setYtValidation(null);
     setYtCookieText('');
     toast({ title: 'تم حذف كوكيز يوتيوب' });
+  };
+
+  const handleValidateYtNow = async () => {
+    setYtChecking(true);
+    setYtValidation(null);
+    const result = await validateYtCookiesApi();
+    setYtChecking(false);
+    setYtValidation(result);
   };
 
   const hasSavedCookies = cookieStatus && cookieStatus.status !== 'invalid' && cookieStatus.hasPSID;
@@ -985,16 +1050,29 @@ export default function Home() {
           <button onClick={() => setShowYtCookies(!showYtCookies)}
             className="w-full flex items-center justify-between px-4 py-3 text-sm text-slate-400 hover:text-slate-300 transition-colors">
             <div className="flex items-center gap-2 flex-wrap">
-              {ytCookieStatus?.hasYtCookies
+              {ytCookieStatus?.hasYtCookies && ytValidation?.valid
                 ? <ShieldCheck className="w-4 h-4 text-emerald-400" />
-                : <ShieldX className="w-4 h-4 text-red-400" />}
+                : ytCookieStatus?.hasYtCookies
+                  ? <ShieldAlert className="w-4 h-4 text-amber-400" />
+                  : <ShieldX className="w-4 h-4 text-red-400" />}
               <span className="text-slate-300 font-medium">كوكيز يوتيوب</span>
-              {ytCookieStatus?.hasYtCookies ? (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-400">{ytCookieStatus.message}</span>
-              ) : (
+              {ytChecking && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-slate-700/50 text-slate-400 flex items-center gap-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />جاري التحقق...
+                </span>
+              )}
+              {!ytChecking && ytValidation?.valid && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-400">{ytValidation.message}</span>
+              )}
+              {!ytChecking && ytValidation && !ytValidation.valid && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-red-900/30 text-red-400">{ytValidation.message}</span>
+              )}
+              {!ytChecking && !ytValidation && ytCookieStatus?.hasYtCookies && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-amber-900/30 text-amber-400">محفوظة — لم يتم التحقق</span>
+              )}
+              {!ytCookieStatus?.hasYtCookies && (
                 <span className="text-xs px-2 py-0.5 rounded-full bg-red-900/30 text-red-400">لا توجد كوكيز</span>
               )}
-              <span className="text-xs text-slate-600">يستخدمها yt-dlp للتحميل</span>
             </div>
             {showYtCookies ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
           </button>
@@ -1004,13 +1082,13 @@ export default function Home() {
               <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
                 <div className="px-4 pb-4 space-y-3 border-t border-slate-800/50 pt-3">
                   <p className="text-xs text-slate-500 leading-relaxed">
-                    الصق كوكيز حساب يوتيوب بصيغة Netscape (نطاق <code className="text-slate-400">.youtube.com</code>). تُستخدم لتحميل الفيديوهات عبر yt-dlp، يتم الحفظ <strong className="text-slate-400">تلقائياً</strong> فور اللصق.
+                    الصق كوكيز حساب يوتيوب بصيغة Netscape (نطاق <code className="text-slate-400">.youtube.com</code>). تُستخدم لتحميل الفيديوهات عبر yt-dlp. يتم الحفظ <strong className="text-slate-400">تلقائياً</strong> فور اللصق، ثم تحقق من صلاحيتها.
                   </p>
 
                   {ytCookieStatus?.hasYtCookies && (
                     <div className="bg-slate-800/40 rounded-lg p-3 space-y-1.5 text-xs">
                       <div className="flex items-center justify-between text-slate-400">
-                        <span>حالة كوكيز يوتيوب</span>
+                        <span>الكوكيز المحفوظة</span>
                         <span className="font-medium text-emerald-400">{ytCookieStatus.message}</span>
                       </div>
                       <div className="flex gap-3 flex-wrap">
@@ -1021,6 +1099,11 @@ export default function Home() {
                           {ytCookieStatus.hasLogin ? '✓' : '–'} LOGIN_INFO
                         </span>
                       </div>
+                      {ytValidation && (
+                        <div className={`mt-1 font-medium ${ytValidation.valid ? 'text-emerald-400' : 'text-red-400'}`}>
+                          نتيجة التحقق: {ytValidation.message}
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -1041,7 +1124,20 @@ export default function Home() {
                   </div>
 
                   <div className="flex gap-2 flex-wrap">
-                    {ytCookieStatus?.hasYtCookies && (
+                    {ytCookieStatus?.hasYtCookies && !ytChecking && (
+                      <Button size="sm" variant="outline"
+                        onClick={handleValidateYtNow}
+                        className="border-violet-700/50 text-violet-300 hover:bg-violet-900/20 gap-1.5">
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        تحقق من صلاحية الكوكيز
+                      </Button>
+                    )}
+                    {ytChecking && (
+                      <Button size="sm" variant="outline" disabled className="border-slate-700 text-slate-500 gap-1.5">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />جاري التحقق...
+                      </Button>
+                    )}
+                    {ytCookieStatus?.hasYtCookies && !ytChecking && (
                       <Button size="sm" variant="destructive" onClick={handleDeleteYtCookies} className="gap-1.5">
                         <Trash2 className="w-3.5 h-3.5" />حذف الكوكيز
                       </Button>

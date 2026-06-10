@@ -1,0 +1,1 @@
+- [yt-dlp n-challenge in Replit](yt-dlp-replit.md) — requires --js-runtimes node:PATH; iOS/android/tv_embedded clients broken in 2026+

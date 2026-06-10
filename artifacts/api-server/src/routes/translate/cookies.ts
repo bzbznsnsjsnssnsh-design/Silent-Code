@@ -179,6 +179,42 @@ export async function deleteYtCookies(): Promise<void> {
   try { await unlink(YT_COOKIES_FILE); } catch { /* ignore */ }
 }
 
+export interface YtCookieValidation {
+  valid: boolean;
+  message: string;
+}
+
+export async function validateYtCookies(): Promise<YtCookieValidation> {
+  try {
+    // Use Node.js for n-challenge solving (required by yt-dlp 2026+)
+    const { stdout } = await execFileAsync("yt-dlp", [
+      "--cookies", YT_COOKIES_FILE,
+      "--js-runtimes", `node:${process.execPath}`,
+      "-j",
+      "--no-playlist",
+      "--no-warnings",
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    ], { timeout: 45_000 });
+    const info = JSON.parse(stdout.trim());
+    if (info?.title) {
+      return { valid: true, message: `الكوكيز صالحة ✅ (${info.title.slice(0, 40)})` };
+    }
+    return { valid: false, message: "الكوكيز لا تعمل — تأكد من صلاحيتها" };
+  } catch (err: any) {
+    const msg = (err?.stderr || err?.stdout || err?.message || "").toString();
+    if (msg.includes("Sign in") || msg.includes("sign in")) {
+      return { valid: false, message: "الكوكيز منتهية — يوتيوب يطلب تسجيل الدخول" };
+    }
+    if (msg.toLowerCase().includes("bot")) {
+      return { valid: false, message: "تم كشف الطلب كبوت — جرب كوكيز مختلفة" };
+    }
+    if (msg.includes("timed out") || msg.includes("ETIMEDOUT")) {
+      return { valid: false, message: "انتهت مهلة التحقق" };
+    }
+    return { valid: false, message: `فشل التحقق: ${msg.slice(0, 120)}` };
+  }
+}
+
 export interface GeminiCookieValidation {
   valid: boolean;
   message: string;
