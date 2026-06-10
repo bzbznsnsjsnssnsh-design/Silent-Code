@@ -131,6 +131,54 @@ export async function deleteCookies(): Promise<void> {
   try { await unlink(COOKIES_FILE); } catch { /* ignore */ }
 }
 
+// ── YouTube-specific cookies (used by yt-dlp) ────────────────────────────────
+
+const YT_COOKIES_FILE = join(tmpdir(), "yt-cookies-direct.txt");
+
+export function getYtCookiesPath(): string {
+  return YT_COOKIES_FILE;
+}
+
+export interface YtCookieStatus {
+  hasYtCookies: boolean;
+  hasSID: boolean;
+  hasLogin: boolean;
+  message: string;
+}
+
+export async function getYtCookiesStatus(): Promise<YtCookieStatus> {
+  try {
+    await access(YT_COOKIES_FILE, constants.F_OK);
+    const content = await readFile(YT_COOKIES_FILE, "utf-8");
+    const hasSID = content.includes("\tSID\t") || content.includes("__Secure-1PSID");
+    const hasLogin = content.includes("LOGIN_INFO") || content.includes("SAPISID");
+    const msg = hasSID && hasLogin ? "محفوظة ومكتملة ✅" : hasSID ? "محفوظة (SID موجود)" : "محفوظة";
+    return { hasYtCookies: true, hasSID, hasLogin, message: msg };
+  } catch {
+    return { hasYtCookies: false, hasSID: false, hasLogin: false, message: "لا توجد كوكيز يوتيوب" };
+  }
+}
+
+export async function hasYtCookies(): Promise<boolean> {
+  try {
+    await access(YT_COOKIES_FILE, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function saveYtCookies(content: string): Promise<void> {
+  if (!content.includes(".youtube.com") && !content.includes("youtube")) {
+    throw new Error("يجب أن تحتوي الكوكيز على نطاق .youtube.com");
+  }
+  await writeFile(YT_COOKIES_FILE, content.trim() + "\n", "utf-8");
+}
+
+export async function deleteYtCookies(): Promise<void> {
+  try { await unlink(YT_COOKIES_FILE); } catch { /* ignore */ }
+}
+
 export interface GeminiCookieValidation {
   valid: boolean;
   message: string;

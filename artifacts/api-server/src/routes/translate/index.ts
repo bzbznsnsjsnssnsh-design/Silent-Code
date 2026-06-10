@@ -5,6 +5,7 @@ import { createJob, getJob } from "./jobs.js";
 import { processVideoSegment, getAudioPath, TTS_VOICES } from "./processor.js";
 import {
   saveCookies, deleteCookies, hasCookies, getDetailedCookiesStatus, validateGeminiCookies,
+  saveYtCookies, deleteYtCookies, getYtCookiesStatus,
 } from "./cookies.js";
 
 const router: IRouter = Router();
@@ -38,6 +39,33 @@ router.post("/translate/cookies", async (req, res) => {
 router.delete("/translate/cookies", async (_req, res) => {
   await deleteCookies();
   res.json({ success: true, message: "تم حذف الكوكيز" });
+});
+
+// ── YouTube cookies (for yt-dlp) ─────────────────────────────────────────────
+
+router.get("/translate/yt-cookies/status", async (_req, res) => {
+  const status = await getYtCookiesStatus();
+  res.json(status);
+});
+
+router.post("/translate/yt-cookies", async (req, res) => {
+  const { cookies } = req.body as { cookies?: string };
+  if (!cookies || typeof cookies !== "string" || cookies.trim().length < 10) {
+    res.status(400).json({ error: "يرجى تقديم محتوى الكوكيز" });
+    return;
+  }
+  try {
+    await saveYtCookies(cookies.trim());
+    const status = await getYtCookiesStatus();
+    res.json({ success: true, message: "تم حفظ كوكيز يوتيوب ✅", status });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || "فشل حفظ الكوكيز" });
+  }
+});
+
+router.delete("/translate/yt-cookies", async (_req, res) => {
+  await deleteYtCookies();
+  res.json({ success: true, message: "تم حذف كوكيز يوتيوب" });
 });
 
 router.post("/translate/cookies/validate", async (_req, res) => {

@@ -7,7 +7,7 @@ import { existsSync } from "fs";
 import { logger } from "../../lib/logger.js";
 import { updateJob } from "./jobs.js";
 import { synthesizeEdgeTTS, EDGE_TTS_VOICES } from "./edge-tts.js";
-import { hasCookies, getCookiesPath } from "./cookies.js";
+import { hasCookies, getCookiesPath, hasYtCookies, getYtCookiesPath } from "./cookies.js";
 import { translateWithGemini, getTranscriptWithGemini } from "./gemini.js";
 
 const execFileAsync = promisify(execFile);
@@ -188,8 +188,10 @@ export async function processVideoSegment(options: ProcessOptions): Promise<void
   let audioOutputPath = "";
 
   try {
-    const cookiesAvailable = await hasCookies();
-    const cookiesArgs = cookiesAvailable ? ["--cookies", getCookiesPath()] : [];
+    const ytCookiesAvailable = await hasYtCookies();
+    const geminiCookiesAvailable = await hasCookies();
+    const cookiesPath = ytCookiesAvailable ? getYtCookiesPath() : geminiCookiesAvailable ? getCookiesPath() : null;
+    const cookiesArgs = cookiesPath ? ["--cookies", cookiesPath] : [];
     const safeUrl = cleanYouTubeUrl(videoUrl);
 
     const tmpDir = await mkdtemp(join(tmpdir(), "vt-"));

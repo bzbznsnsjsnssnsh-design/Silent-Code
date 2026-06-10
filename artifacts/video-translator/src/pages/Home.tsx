@@ -80,6 +80,37 @@ async function fetchStatus(jobId: string) {
   return r.json();
 }
 
+interface YtCookieStatus {
+  hasYtCookies: boolean;
+  hasSID: boolean;
+  hasLogin: boolean;
+  message: string;
+}
+
+async function fetchYtCookieStatus(): Promise<YtCookieStatus> {
+  try {
+    const r = await fetch('/api/translate/yt-cookies/status');
+    return await r.json();
+  } catch {
+    return { hasYtCookies: false, hasSID: false, hasLogin: false, message: 'فشل الاتصال' };
+  }
+}
+
+async function postYtCookies(content: string): Promise<{ success: boolean; message: string; status?: YtCookieStatus }> {
+  const r = await fetch('/api/translate/yt-cookies', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cookies: content }),
+  });
+  const d = await r.json();
+  if (!r.ok) return { success: false, message: d.error || 'فشل الحفظ' };
+  return { success: true, message: d.message, status: d.status };
+}
+
+async function deleteYtCookiesReq() {
+  await fetch('/api/translate/yt-cookies', { method: 'DELETE' });
+}
+
 async function fetchCookieStatus(): Promise<CookieStatus> {
   try {
     const r = await fetch('/api/translate/cookies/status');
@@ -167,10 +198,17 @@ export default function Home() {
   const [geminiValidation, setGeminiValidation] = useState<GeminiValidation | null>(null);
   const [geminiChecking, setGeminiChecking] = useState(false);
 
+  const [showYtCookies, setShowYtCookies] = useState(false);
+  const [ytCookieText, setYtCookieText] = useState('');
+  const [ytCookieStatus, setYtCookieStatus] = useState<YtCookieStatus | null>(null);
+  const [ytCookieSaving, setYtCookieSaving] = useState(false);
+  const ytSaveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const { data: modelsData } = useGetTtsModels();
 
   useEffect(() => {
     fetchCookieStatus().then(setCookieStatus);
+    fetchYtCookieStatus().then(setYtCookieStatus);
   }, []);
 
   useEffect(() => {
@@ -560,6 +598,32 @@ export default function Home() {
     toast({ title: 'تم حذف الكوكيز' });
   };
 
+  const handleYtCookieChange = (text: string) => {
+    setYtCookieText(text);
+    if (ytSaveDebounceRef.current) clearTimeout(ytSaveDebounceRef.current);
+    if (text.trim().length < 20) return;
+
+    ytSaveDebounceRef.current = setTimeout(async () => {
+      setYtCookieSaving(true);
+      const result = await postYtCookies(text.trim());
+      setYtCookieSaving(false);
+      if (result.success) {
+        if (result.status) setYtCookieStatus(result.status);
+        setYtCookieText('');
+        toast({ title: 'تم حفظ كوكيز يوتيوب ✅' });
+      } else {
+        toast({ title: 'خطأ', description: result.message, variant: 'destructive' });
+      }
+    }, 800);
+  };
+
+  const handleDeleteYtCookies = async () => {
+    await deleteYtCookiesReq();
+    setYtCookieStatus(null);
+    setYtCookieText('');
+    toast({ title: 'تم حذف كوكيز يوتيوب' });
+  };
+
   const hasSavedCookies = cookieStatus && cookieStatus.status !== 'invalid' && cookieStatus.hasPSID;
   const activeJob = activeSeg >= 0 ? jobs.get(activeSeg) : undefined;
 
@@ -906,6 +970,79 @@ export default function Home() {
                     )}
                     {hasSavedCookies && (
                       <Button size="sm" variant="destructive" onClick={handleDeleteCookies} className="gap-1.5">
+                        <Trash2 className="w-3.5 h-3.5" />حذف الكوكيز
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </Card>
+
+        {/* ─── YouTube Cookies Panel ──────────────────────────────────────────── */}
+        <Card className="bg-slate-900/30 border-slate-800/40">
+          <button onClick={() => setShowYtCookies(!showYtCookies)}
+            className="w-full flex items-center justify-between px-4 py-3 text-sm text-slate-400 hover:text-slate-300 transition-colors">
+            <div className="flex items-center gap-2 flex-wrap">
+              {ytCookieStatus?.hasYtCookies
+                ? <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                : <ShieldX className="w-4 h-4 text-red-400" />}
+              <span className="text-slate-300 font-medium">كوكيز يوتيوب</span>
+              {ytCookieStatus?.hasYtCookies ? (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-400">{ytCookieStatus.message}</span>
+              ) : (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-red-900/30 text-red-400">لا توجد كوكيز</span>
+              )}
+              <span className="text-xs text-slate-600">يستخدمها yt-dlp للتحميل</span>
+            </div>
+            {showYtCookies ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
+
+          <AnimatePresence>
+            {showYtCookies && (
+              <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+                <div className="px-4 pb-4 space-y-3 border-t border-slate-800/50 pt-3">
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    الصق كوكيز حساب يوتيوب بصيغة Netscape (نطاق <code className="text-slate-400">.youtube.com</code>). تُستخدم لتحميل الفيديوهات عبر yt-dlp، يتم الحفظ <strong className="text-slate-400">تلقائياً</strong> فور اللصق.
+                  </p>
+
+                  {ytCookieStatus?.hasYtCookies && (
+                    <div className="bg-slate-800/40 rounded-lg p-3 space-y-1.5 text-xs">
+                      <div className="flex items-center justify-between text-slate-400">
+                        <span>حالة كوكيز يوتيوب</span>
+                        <span className="font-medium text-emerald-400">{ytCookieStatus.message}</span>
+                      </div>
+                      <div className="flex gap-3 flex-wrap">
+                        <span className={ytCookieStatus.hasSID ? 'text-emerald-500' : 'text-red-500'}>
+                          {ytCookieStatus.hasSID ? '✓' : '✗'} SID
+                        </span>
+                        <span className={ytCookieStatus.hasLogin ? 'text-emerald-500' : 'text-slate-600'}>
+                          {ytCookieStatus.hasLogin ? '✓' : '–'} LOGIN_INFO
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="relative">
+                    <Textarea
+                      placeholder="# Netscape HTTP Cookie File&#10;.youtube.com  TRUE    /       TRUE    ...&#10;&#10;الصق كوكيز يوتيوب هنا — يحفظ تلقائياً"
+                      value={ytCookieText}
+                      onChange={e => handleYtCookieChange(e.target.value)}
+                      className="bg-slate-800 border-slate-700 text-slate-300 text-xs font-mono h-32 resize-none"
+                      dir="ltr"
+                    />
+                    {ytCookieSaving && (
+                      <div className="absolute inset-0 bg-slate-800/80 rounded-md flex items-center justify-center gap-2 text-sm text-slate-300">
+                        <Loader2 className="w-4 h-4 animate-spin text-violet-400" />
+                        جاري الحفظ...
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex gap-2 flex-wrap">
+                    {ytCookieStatus?.hasYtCookies && (
+                      <Button size="sm" variant="destructive" onClick={handleDeleteYtCookies} className="gap-1.5">
                         <Trash2 className="w-3.5 h-3.5" />حذف الكوكيز
                       </Button>
                     )}
