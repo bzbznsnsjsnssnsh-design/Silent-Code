@@ -101,7 +101,7 @@ export async function translateWithGemini(
       videoUrl: videoUrl ?? "",
       startTime: startTime ?? 0,
     }),
-    signal: AbortSignal.timeout(90_000),
+    signal: AbortSignal.timeout(200_000),
   });
 
   const data = await res.json() as { translation?: string; cleanText?: string; error?: string };

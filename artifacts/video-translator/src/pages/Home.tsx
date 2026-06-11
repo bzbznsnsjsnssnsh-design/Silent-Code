@@ -130,11 +130,29 @@ function parseTranslationSegments(translation: string): {ts: number; text: strin
     const text = m[4].trim();
     if (text) segs.push({ ts, text });
   }
-  // If no timestamp format, treat whole text as one segment starting at t=0
   if (segs.length === 0 && translation.trim()) {
     segs.push({ ts: 0, text: translation.trim() });
   }
   return segs;
+}
+
+/** Per-word entry with interpolated timestamp */
+interface WordTiming { word: string; ts: number; }
+
+/** Build per-word timings by interpolating within each phrase's time span */
+function buildWordTimings(translation: string, segStart: number): WordTiming[] {
+  const segs = parseTranslationSegments(translation);
+  const result: WordTiming[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const nextTs = i + 1 < segs.length ? segs[i + 1].ts : segStart + SEGMENT_STRIDE;
+    const dur = Math.max(0.5, nextTs - segs[i].ts);
+    const wordsArr = segs[i].text.split(/\s+/).filter(Boolean);
+    wordsArr.forEach((w, wi) => result.push({
+      word: w,
+      ts: segs[i].ts + (wi / Math.max(1, wordsArr.length)) * dur,
+    }));
+  }
+  return result;
 }
 
 async function fetchCookieStatus(): Promise<CookieStatus> {
@@ -205,9 +223,9 @@ export default function Home() {
   const syncOffsetRef = useRef<number>(0);
   const [syncOffset, setSyncOffset] = useState<number>(0);
 
-  // ── Progressive text display ──────────────────────────────────────────────
-  const currentTranslationSegsRef = useRef<{ts: number; text: string}[]>([]);
-  const lastShownSentenceRef = useRef<string>('');
+  // ── Word-level display ────────────────────────────────────────────────────
+  const allWordsRef = useRef<WordTiming[]>([]);
+  const currentWordIndexRef = useRef<number>(-1);
 
   const [jobs, setJobs] = useState<Map<number, SegJob>>(new Map());
   const [activeSeg, setActiveSeg] = useState<number>(-1);
@@ -219,7 +237,8 @@ export default function Home() {
   const [selectedEngine] = useState<TranslationEngine>('openai');
   const [hasStarted, setHasStarted] = useState(false);
   const [isWaitingForProcess, setIsWaitingForProcess] = useState(false);
-  const [currentSentence, setCurrentSentence] = useState('');
+  const [currentWords, setCurrentWords] = useState<string[]>([]);
+  const [currentWordIdx, setCurrentWordIdx] = useState<number>(-1);
 
   const [showCookies, setShowCookies] = useState(false);
   const [cookieText, setCookieText] = useState('');
@@ -450,20 +469,30 @@ export default function Home() {
 
     playingSegRef.current = seg;
     segPlayStartMsRef.current = Date.now();
-    // Load segments for progressive display (don't show all text at once)
-    currentTranslationSegsRef.current = parseTranslationSegments(job.translation || '');
-    lastShownSentenceRef.current = '';
-    setCurrentSentence('');
+
+    // Build word timings for this segment and merge into allWordsRef
+    const newWords = buildWordTimings(job.translation || '', seg);
+    allWordsRef.current = [
+      ...allWordsRef.current.filter(w => w.ts < seg || w.ts >= seg + SEGMENT_STRIDE),
+      ...newWords,
+    ].sort((a, b) => a.ts - b.ts);
+    // Reset word pointer — runLoop will advance it via audio time
+    currentWordIndexRef.current = -1;
+    setCurrentWordIdx(-1);
+    if (newWords.length > 0) setCurrentWords(allWordsRef.current.map(w => w.word));
 
     audioEl.onloadedmetadata = () => applySyncRates(audioEl);
 
     audioEl.onended = () => {
       finishedSegRef.current = seg;
-      currentTranslationSegsRef.current = [];
-      lastShownSentenceRef.current = '';
-      setCurrentSentence('');
+      // ── Don't clear words/display — keep showing last word until next segment starts ──
       if (ytRef.current) ytRef.current.setPlaybackRate(1.0);
+
+      // Save standby state BEFORE we clear it (gapless bug fix)
+      const wasStandbyReady = standbyReadyRef.current;
+      const savedStandbyUrl = standbyUrlRef.current;
       standbyReadyRef.current = false;
+      standbyUrlRef.current = '';
 
       if (!isRunningRef.current) return;
 
@@ -472,8 +501,8 @@ export default function Home() {
 
       const sb = getStandbyAudio();
       const canGapless =
-        standbyReadyRef.current &&
-        standbyUrlRef.current === nextJob.audioUrl &&
+        wasStandbyReady &&
+        savedStandbyUrl === nextJob.audioUrl &&
         sb !== null &&
         sb.readyState >= 2;
 
@@ -481,13 +510,17 @@ export default function Home() {
         getActiveAudio()?.pause();
         swapSlot();
         const nowActive = getActiveAudio()!;
-        standbyUrlRef.current = '';
-        standbyReadyRef.current = false;
-        playingSegRef.current = -1;
 
-        currentTranslationSegsRef.current = parseTranslationSegments(nextJob.translation || '');
-        lastShownSentenceRef.current = '';
-        setCurrentSentence('');
+        // Build word timings for next segment
+        const nextWords = buildWordTimings(nextJob.translation || '', nextSeg);
+        allWordsRef.current = [
+          ...allWordsRef.current.filter(w => w.ts < nextSeg || w.ts >= nextSeg + SEGMENT_STRIDE),
+          ...nextWords,
+        ].sort((a, b) => a.ts - b.ts);
+        currentWordIndexRef.current = -1;
+        setCurrentWordIdx(-1);
+        if (nextWords.length > 0) setCurrentWords(allWordsRef.current.map(w => w.word));
+
         playingSegRef.current = nextSeg;
         segPlayStartMsRef.current = Date.now();
 
@@ -495,9 +528,6 @@ export default function Home() {
         nowActive.onloadedmetadata = () => applySyncRates(nowActive);
         nowActive.onended = () => {
           finishedSegRef.current = nextSeg;
-          currentTranslationSegsRef.current = [];
-          lastShownSentenceRef.current = '';
-          setCurrentSentence('');
           if (ytRef.current) ytRef.current.setPlaybackRate(1.0);
           standbyReadyRef.current = false;
           playingSegRef.current = -1;
@@ -516,17 +546,42 @@ export default function Home() {
     preloadNextIntoStandby(seg);
   }, [applySyncRates, preloadNextIntoStandby]);
 
-  const seekToSegment = (offset: number) => {
-    if (!ytRef.current) return;
-    const currentTime = ytRef.current.getCurrentTime();
-    const newTime = Math.max(0, Math.floor(currentTime / SEGMENT_STRIDE) * SEGMENT_STRIDE + (offset * SEGMENT_STRIDE));
-    playingSegRef.current = -1; finishedSegRef.current = -1;
-    standbyUrlRef.current = ''; standbyReadyRef.current = false;
-    getActiveAudio()?.pause();
-    getStandbyAudio()?.pause();
-    if (ytRef.current) ytRef.current.setPlaybackRate(1.0);
-    ytRef.current.seekTo(newTime, true);
-  };
+  const navigateWord = useCallback((delta: -1 | 1) => {
+    const words = allWordsRef.current;
+    if (words.length === 0 || !ytRef.current) return;
+
+    const currIdx = currentWordIndexRef.current;
+    const startIdx = currIdx < 0 ? (delta === 1 ? 0 : 0) : currIdx;
+    const newIdx = Math.max(0, Math.min(words.length - 1, startIdx + delta));
+
+    const targetTs = words[newIdx].ts;
+    currentWordIndexRef.current = newIdx;
+    setCurrentWordIdx(newIdx);
+
+    // Seek video to word timestamp
+    ytRef.current.seekTo(targetTs, true);
+
+    // Seek audio proportionally to match word position
+    const audioEl = getActiveAudio();
+    const seg = playingSegRef.current;
+    if (audioEl && audioEl.duration > 0 && seg >= 0) {
+      const offsetInSeg = Math.max(0, targetTs - seg);
+      const audioTarget = Math.min((offsetInSeg / SEGMENT_STRIDE) * audioEl.duration, audioEl.duration - 0.1);
+      audioEl.currentTime = Math.max(audioTarget, 0);
+    }
+
+    // If target is in a different segment, reset audio so runLoop picks up new segment
+    const targetSeg = Math.floor(targetTs / SEGMENT_STRIDE) * SEGMENT_STRIDE;
+    if (seg >= 0 && targetSeg !== seg) {
+      playingSegRef.current = -1;
+      finishedSegRef.current = -1;
+      standbyUrlRef.current = '';
+      standbyReadyRef.current = false;
+      getActiveAudio()?.pause();
+      getStandbyAudio()?.pause();
+      if (ytRef.current) ytRef.current.setPlaybackRate(1.0);
+    }
+  }, []);
 
   const startTranslation = useCallback(async () => {
     if (!ytRef.current || !isValid || !selectedVoice) return;
@@ -534,8 +589,12 @@ export default function Home() {
     setIsRunning(true); setHasStarted(true); setIsWaitingForProcess(false);
     jobsRef.current.clear(); kickCountRef.current.clear(); lastRetryRef.current.clear(); syncJobs();
     standbyUrlRef.current = ''; standbyReadyRef.current = false;
-    // Reset sync offset on new session
+    // Reset sync offset and word state on new session
     syncOffsetRef.current = 0; setSyncOffset(0);
+    allWordsRef.current = [];
+    currentWordIndexRef.current = -1;
+    setCurrentWordIdx(-1);
+    setCurrentWords([]);
     const dur = ytRef.current.getDuration() || duration;
 
     const runLoop = async () => {
@@ -543,17 +602,25 @@ export default function Home() {
       while (!stopRequestedRef.current) {
         const currentTime = ytRef.current?.getCurrentTime() ?? 0;
 
-        // ── Progressive text display: show segment matching current video time ─
-        const tranSegs = currentTranslationSegsRef.current;
-        if (tranSegs.length > 0) {
-          let matched: {ts: number; text: string} | null = null;
-          for (const s of tranSegs) {
-            if (s.ts <= currentTime) matched = s;
+        // ── Word display: driven by audio time for accurate TTS sync ──────────
+        const words = allWordsRef.current;
+        if (words.length > 0) {
+          const audioEl = getActiveAudio();
+          let effectiveTs: number;
+          if (audioEl && !audioEl.paused && !audioEl.ended && audioEl.duration > 0 && playingSegRef.current >= 0) {
+            // Use audio time as source of truth — matches what's being spoken
+            effectiveTs = playingSegRef.current + (audioEl.currentTime / audioEl.duration) * SEGMENT_STRIDE;
+          } else {
+            effectiveTs = currentTime;
+          }
+          let bestIdx = -1;
+          for (let i = 0; i < words.length; i++) {
+            if (words[i].ts <= effectiveTs) bestIdx = i;
             else break;
           }
-          if (matched && matched.text !== lastShownSentenceRef.current) {
-            lastShownSentenceRef.current = matched.text;
-            setCurrentSentence(matched.text);
+          if (bestIdx >= 0 && bestIdx !== currentWordIndexRef.current) {
+            currentWordIndexRef.current = bestIdx;
+            setCurrentWordIdx(bestIdx);
           }
         }
 
@@ -612,6 +679,10 @@ export default function Home() {
     standbyUrlRef.current = ''; standbyReadyRef.current = false;
     activeSegRef.current = -1; setActiveSeg(-1);
     segPlayStartMsRef.current = 0;
+    allWordsRef.current = [];
+    currentWordIndexRef.current = -1;
+    setCurrentWordIdx(-1);
+    setCurrentWords([]);
   }, []);
 
   const handleCookieChange = (text: string) => {
@@ -797,15 +868,33 @@ export default function Home() {
             </div>
 
             <AnimatePresence>
-              {isRunning && currentSentence && (
+              {isRunning && currentWords.length > 0 && (
                 <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
                   className="px-4 py-3 bg-black/70 border-t border-white/10">
-                  <p className="text-white text-center text-base font-medium leading-relaxed">{currentSentence}</p>
+                  {/* Word-by-word display — current word highlighted */}
+                  <div className="flex flex-wrap gap-x-1.5 gap-y-1 justify-center leading-relaxed min-h-[2rem]">
+                    {currentWords.map((word, i) => {
+                      const isCurrent = i === currentWordIdx;
+                      const isPast = currentWordIdx >= 0 && i < currentWordIdx;
+                      return (
+                        <span key={i} className={`text-base font-medium transition-colors duration-75 ${
+                          isCurrent
+                            ? 'text-yellow-300 font-bold underline underline-offset-2'
+                            : isPast
+                            ? 'text-slate-500'
+                            : 'text-white'
+                        }`}>
+                          {word}
+                        </span>
+                      );
+                    })}
+                  </div>
+                  {/* Prev / Next word navigation */}
                   <div className="flex justify-center gap-4 mt-2">
-                    <Button size="sm" variant="ghost" onClick={() => seekToSegment(-1)} className="text-slate-300 hover:text-white hover:bg-white/10">
+                    <Button size="sm" variant="ghost" onClick={() => navigateWord(-1)} className="text-slate-300 hover:text-white hover:bg-white/10">
                       <ChevronRight className="w-4 h-4 ml-1" />السابق
                     </Button>
-                    <Button size="sm" variant="ghost" onClick={() => seekToSegment(1)} className="text-slate-300 hover:text-white hover:bg-white/10">
+                    <Button size="sm" variant="ghost" onClick={() => navigateWord(1)} className="text-slate-300 hover:text-white hover:bg-white/10">
                       التالي<ChevronLeft className="w-4 h-4 mr-1" />
                     </Button>
                   </div>

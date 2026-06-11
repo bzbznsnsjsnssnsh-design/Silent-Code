@@ -31,21 +31,59 @@ def parse_cookies(path: str) -> dict:
         pass
     return result
 
+async def _create_client():
+    from gemini_webapi import GeminiClient
+    cookies = parse_cookies(COOKIES_PATH)
+    psid = cookies.get("__Secure-1PSID", "")
+    psidts = cookies.get("__Secure-1PSIDTS", "")
+    if not psid:
+        raise ValueError("__Secure-1PSID غير موجود في ملف الكوكيز")
+    client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
+    await client.init(timeout=60, auto_close=False, close_delay=3600, auto_refresh=True)
+    return client
+
 async def get_client():
     global _client
     async with _init_lock:
         if _client is not None:
             return _client
-        from gemini_webapi import GeminiClient
-        cookies = parse_cookies(COOKIES_PATH)
-        psid = cookies.get("__Secure-1PSID", "")
-        psidts = cookies.get("__Secure-1PSIDTS", "")
-        if not psid:
-            raise ValueError("__Secure-1PSID غير موجود في ملف الكوكيز")
-        client = GeminiClient(secure_1psid=psid, secure_1psidts=psidts)
-        await client.init(timeout=30, auto_close=False, close_delay=3600, auto_refresh=True)
-        _client = client
-        return client
+        _client = await _create_client()
+        return _client
+
+async def reset_client():
+    """Force-reset the client so next get_client() creates a fresh one."""
+    global _client
+    async with _init_lock:
+        if _client is not None:
+            try:
+                await _client.close()
+            except Exception:
+                pass
+        _client = None
+
+async def generate_with_retry(prompt: str, max_retries: int = 3) -> str:
+    """Call generate_content with per-attempt timeout and full client re-init on failure."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            client = await get_client()
+            # 55-second per-attempt timeout (fits within Node.js 90s AbortSignal)
+            raw = await asyncio.wait_for(
+                client.generate_content(prompt),
+                timeout=55.0,
+            )
+            text = (getattr(raw, "text", None) or "").strip()
+            if text:
+                return text
+            raise ValueError("نتيجة فارغة من Gemini")
+        except Exception as e:
+            last_err = e
+            print(f"[gemini] attempt {attempt + 1}/{max_retries} failed: {e}", flush=True)
+            if attempt < max_retries - 1:
+                # Force full re-initialization before retry
+                await reset_client()
+                await asyncio.sleep(2.0)
+    raise last_err
 
 def clean_response(text: str) -> str:
     """Remove common Gemini preambles/postambles that pollute the translation."""
@@ -248,10 +286,7 @@ async def handle_translate(request: web.Request) -> web.Response:
             "OUTPUT (inside ```text code block with [HH:MM:SS] timestamps):"
         )
 
-        response = await client.generate_content(prompt)
-        raw = (response.text or "").strip()
-        if not raw:
-            raise ValueError("نتيجة فارغة من Gemini")
+        raw = await generate_with_retry(prompt)
 
         # Extract content from markdown code block if Gemini wrapped it
         timestamped = extract_code_block(raw)
@@ -271,12 +306,8 @@ async def handle_translate(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 async def handle_reload(request: web.Request) -> web.Response:
-    global _client
     try:
-        if _client is not None:
-            try: await _client.close()
-            except: pass
-        _client = None
+        await reset_client()
         await get_client()
         return web.json_response({"ok": True, "message": "تم إعادة تهيئة عميل Gemini"})
     except Exception as e:
